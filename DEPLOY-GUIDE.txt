@@ -1,0 +1,86 @@
+=====================================================
+NKP LUDO PRO — SERVER v4 (Razorpay Diagnostic Edition)
+=====================================================
+
+ये version खास बनाया गया है ताकि "payment क्यों नहीं चल रहा"
+की समस्या आप खुद 1 मिनट में पकड़ सकें — बिना कोड देखे।
+
+-----------------------------------------------------
+STEP 1 — Render पर deploy करें (पहले जैसा ही)
+-----------------------------------------------------
+GitHub repo (narendrakumar/nkp-ludo-pro) के server/ folder में
+इस zip की files (server.js, package.json, Dockerfile, public/) डालें
+→ commit → Render auto-deploy।
+
+-----------------------------------------------------
+STEP 2 — ★ Keys की जाँच (सबसे ज़रूरी) ★
+-----------------------------------------------------
+Deploy होने के बाद browser में खोलें:
+
+    https://nkp-ludo-pro.onrender.com/api/razorpay/status
+
+(अपना Render URL डालें)
+
+इस पेज पर आपको सीधा जवाब मिलेगा:
+
+✅ ok: true  → keys सही हैं, payment बनना चाहिए
+⚠ problem: "ENV_NOT_SET"
+    → Render Environment में keys डालना भूल गए / गलत नाम से दी हैं
+⚠ problem: "KEYS_INVALID"
+    → keys गलत हैं — Razorpay Dashboard से दोबारा copy करें
+⚠ problem: "NETWORK"
+    → Render से api.razorpay.com तक पहुँच नहीं बन रही
+
+-----------------------------------------------------
+STEP 3 — Render में keys ऐसे डालें (सबसे common गलती)
+-----------------------------------------------------
+Render Dashboard → अपनी service → Environment (बाईं ओर) → Add:
+    Key:   RAZORPAY_KEY_ID          Value: rzp_live_xxxxxxxx
+    Key:   RAZORPAY_KEY_SECRET      Value: (आपकी secret)
+    Key:   RAZORPAY_WEBHOOK_SECRET  Value: (STEP 4 के बाद डालें)
+
+ध्यान:
+- Key/Secret के आगे-पीछे कोई SPACE नहीं, कोई quote (" ') नहीं
+- Key ID "rzp_live_..." से शुरू होनी चाहिए (Live mode)
+- Save & Deploy के बाद फिर STEP 2 वाला link खोलकर confirm करें
+- Live keys वाले account का KYC complete होना चाहिए
+  (Razorpay Dashboard → Home पर दिखता है), वरना payment
+  create होकर fail होगा।
+
+-----------------------------------------------------
+STEP 4 — Razorpay Dashboard में Webhook (payment events)
+-----------------------------------------------------
+Razorpay Dashboard → Settings → Webhooks → Add New Webhook:
+    URL:      https://nkp-ludo-pro.onrender.com/api/razorpay/webhook
+              (अपना Render URL डालें)
+    Secret:   कोई भी लंबा password (copy रखें)
+    Event:    payment.captured  select करें
+
+फिर वही Secret Render Environment में
+RAZORPAY_WEBHOOK_SECRET नाम से डालें।
+
+अब payment होते ही server खुद coins credit कर देगा —
+भले ही player ने app बंद कर दी हो।
+
+-----------------------------------------------------
+STEP 5 — Payment की पूरी जाँच (क्या हो रहा देखें)
+-----------------------------------------------------
+Browser में खोलें:
+
+    https://nkp-ludo-pro.onrender.com/api/razorpay/log
+
+यहाँ हर payment की कोशिश दिखेगी: create_order_ok,
+create_order_failed, verify_ok, webhook_credit वगैरह —
+आख़िरी 100 events। इसी से पता चलेगा कि अटकना कहाँ है:
+
+- create_order_failed + "Authentication failed" = keys गलत
+- create_order_failed + "amount must be at least" = pack की कीमत < ₹10
+- कुछ नहीं दिखता = app server तक पहुँच ही नहीं पा रही
+  (app का SERVER_URL check करें / server सो रहा हो तो पहले
+  app खोलकर जगा लें)
+
+-----------------------------------------------------
+टेस्ट टिप: पहले Razorpay TEST keys (rzp_test_...) से
+status पेज खोलकर flow जाँचें, फिर LIVE keys डालें।
+दोनों एक साथ कभी न मिलाएँ।
+=====================================================
