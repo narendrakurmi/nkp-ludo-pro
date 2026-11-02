@@ -73,14 +73,28 @@ function payLog(entry) {
 // Idempotency: webhook में एक ही payment दो बार credit न हो
 const PROCESSED_PAYMENTS = new Set();
 
-// === PERSISTENCE (best-effort disk; Render free tier is ephemeral) ===
-const DATA_FILE = path.join('/tmp', 'nkp_data.json');
+// === PERSISTENCE (v5.14) ===
+// असली पक्की जगह: Render → Disk लगाएँ और DATA_DIR=/var/data सेट करें।
+// न मिले तो /tmp (अस्थायी) पर गिर जाता है — तब server restart पर डेटा मिट सकता है।
+const DATA_DIR = (function () {
+  const cands = [process.env.DATA_DIR, '/var/data', '/data', path.join(process.cwd(), 'data')].filter(Boolean);
+  for (const d of cands) {
+    try { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); fs.accessSync(d, fs.constants.W_OK); return d; } catch (e) {}
+  }
+  return '/tmp';
+})();
+const DATA_FILE = path.join(DATA_DIR, 'nkp_data.json');
+const DATA_BAK  = path.join(DATA_DIR, 'nkp_data.bak.json');
+console.log('DB storage dir:', DATA_DIR, (DATA_DIR === '/tmp' ? '(TEMPORARY — data may be lost on restart)' : '(persistent)'));
 let DB = { users: {}, friends: {}, purchases: [] };
 
 function loadDB() {
   try {
-    if (fs.existsSync(DATA_FILE)) {
-      DB = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
+    let src = null;
+    if (fs.existsSync(DATA_FILE)) src = DATA_FILE;
+    else if (fs.existsSync(DATA_BAK)) src = DATA_BAK;
+    if (src) {
+      DB = JSON.parse(fs.readFileSync(src, 'utf-8'));
       if (!DB.users) DB.users = {};
       if (!DB.friends) DB.friends = {};
       if (!DB.purchases) DB.purchases = [];
@@ -92,7 +106,12 @@ function saveDB() {
   if (dbSaveTimer) return;
   dbSaveTimer = setTimeout(() => {
     dbSaveTimer = null;
-    try { fs.writeFileSync(DATA_FILE, JSON.stringify(DB)); } catch (e) {}
+    try {
+      const tmp = DATA_FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(DB));
+      try { if (fs.existsSync(DATA_FILE)) fs.copyFileSync(DATA_FILE, DATA_BAK); } catch (e2) {}
+      fs.renameSync(tmp, DATA_FILE);
+    } catch (e) { console.log('DB save failed:', e.message); }
   }, 2000);
 }
 loadDB();
@@ -116,8 +135,19 @@ function publicUser(u) {
     coins: u.coins, gems: u.gems, totalEarned: u.totalEarned,
     gamesWon: u.gamesWon, gamesLost: u.gamesLost, gamesPlayed: u.gamesPlayed,
     playerLevel: u.playerLevel, playerXP: u.playerXP,
+    name: u.displayName || '', phone: u.phone || '', email: u.email || '',
+    avatar: u.avatar || '', backup: u.backup || null, backupAt: u.backupAt || 0,
     friends: DB.friends[u.username] || []
   };
+}
+
+// v5.15: रिकवरी कोड — भ्रम से बचाने के लिए O/0 और I/1 हटा दिए
+function makeRecoveryCode() {
+  const abc = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let out = '';
+  const rnd = crypto.randomBytes(10);
+  for (let i = 0; i < 10; i++) out += abc[rnd[i] % abc.length];
+  return out.slice(0, 5) + '-' + out.slice(5);
 }
 
 // === HTTP HELPERS ===
@@ -215,7 +245,7 @@ const server = http.createServer(async (req, res) => {
     let roomsCount = 0;
     try { roomsCount = rooms.size; } catch (e) {}
     sendJSON(res, 200, {
-      ok: true, serverVersion: '5.13', uptime: Math.round(process.uptime()),
+      ok: true, serverVersion: '5.15', uptime: Math.round(process.uptime()),
       users: Object.keys(DB.users || {}).length,
       rooms: roomsCount,
       onlineClients: wsClients ? wsClients.size : 0,
@@ -235,7 +265,7 @@ const server = http.createServer(async (req, res) => {
   if (reqPath === '/health' && method === 'GET') {
     sendJSON(res, 200, {
       ok: true, uptime: process.uptime(), users: Object.keys(DB.users).length,
-      serverVersion: '5.13',
+      serverVersion: '5.15',
       payments: 'disabled',
       protections: {
         adminKey: ADMIN_KEY ? 'set' : 'not_set',
@@ -343,7 +373,7 @@ const server = http.createServer(async (req, res) => {
 
   if (reqPath === '/api/version' && method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, versionCode: 53, versionName: '1.38' }));
+    res.end(JSON.stringify({ ok: true, versionCode: 60, versionName: '1.45' }));
     return;
   }
   if (reqPath === '/api/wake' && method === 'GET') {
@@ -356,14 +386,19 @@ const server = http.createServer(async (req, res) => {
     const b = await readBody(req);
     const username = String(b.username || '').trim().toLowerCase();
     const password = String(b.password || '');
-    if (username.length < 3 || username.length > 20 || !/^[a-z0-9_]+$/.test(username)) {
-      sendJSON(res, 400, { ok: false, error: 'Invalid username (3-20 chars, a-z 0-9 _)' }); return;
+    // v5.14: ईमेल आईडी भी username बन सके (a-z 0-9 _ . @ -), 3-40 अक्षर
+    if (username.length < 3 || username.length > 40 || !/^[a-z0-9_.@-]+$/.test(username)) {
+      sendJSON(res, 400, { ok: false, error: 'Invalid username/email (3-40 chars, a-z 0-9 _ . @ -)' }); return;
     }
-    if (password.length < 4) { sendJSON(res, 400, { ok: false, error: 'Password too short (min 4)' }); return; }
+    if (password.length < 6) { sendJSON(res, 400, { ok: false, error: 'Password too short (min 6)' }); return; }
     if (DB.users[username]) { sendJSON(res, 409, { ok: false, error: 'Username already taken' }); return; }
     const salt = crypto.randomBytes(16).toString('hex');
+    // v5.15: रिकवरी कोड — पासवर्ड भूलने पर इससे नया पासवर्ड बनता है
+    const recoveryCode = makeRecoveryCode();
+    const recSalt = crypto.randomBytes(16).toString('hex');
     DB.users[username] = {
       username, salt, hash: hashPassword(password, salt),
+      recSalt, recHash: hashPassword(recoveryCode, recSalt),
       coins: 0, gems: 0, totalEarned: 0,
       gamesWon: 0, gamesLost: 0, gamesPlayed: 0,
       playerLevel: 1, playerXP: 0, createdAt: Date.now()
@@ -372,7 +407,7 @@ const server = http.createServer(async (req, res) => {
     const token = makeToken();
     tokens.set(token, username);
     saveDB();
-    sendJSON(res, 200, { ok: true, token, username });
+    sendJSON(res, 200, { ok: true, token, username, recoveryCode });
     return;
   }
 
@@ -407,24 +442,24 @@ const server = http.createServer(async (req, res) => {
     const b = await readBody(req);
     // Anti-cheat: coins/gems may only grow by 5000/200 per sync — पर verified purchase कभी नहीं कटेगा
     const growth = (Number(b.coins) || 0) - (u.coins || 0);
-    if (growth <= 5000 && growth >= -100000) u.coins = Math.max(0, Math.floor(Number(b.coins) || 0));
-    else if (growth > 5000) {
+    if (growth <= 50000 && growth >= -1000000) u.coins = Math.max(0, Math.floor(Number(b.coins) || 0));
+    else if (growth > 50000) {
       let covered = (u.purchaseCredit || 0);
-      if (growth > 5000 + covered) covered += (await purchaseCoverFor(uname)).coins; // ★ Razorpay से पूछकर असली खरीद cover करो
-      if (growth <= 5000 + covered) { u.coins = Math.max(0, Math.floor(Number(b.coins) || 0)); u.purchaseCredit = Math.max(0, covered - growth); }
+      if (growth > 50000 + covered) covered += (await purchaseCoverFor(uname)).coins; // ★ Razorpay से पूछकर असली खरीद cover करो
+      if (growth <= 50000 + covered) { u.coins = Math.max(0, Math.floor(Number(b.coins) || 0)); u.purchaseCredit = Math.max(0, covered - growth); }
       else {
-        u.coins = (u.coins || 0) + 5000; // reject suspicious jump
-        payLog({ type: 'sync_cut', username: uname, sentCoins: b.coins, keptCoins: u.coins, reason: 'growth > 5000 + purchase cover' });
+        u.coins = (u.coins || 0) + 50000; // reject suspicious jump
+        payLog({ type: 'sync_cut', username: uname, sentCoins: b.coins, keptCoins: u.coins, reason: 'growth > 50000 + purchase cover' });
       }
     }
     const gGem = (Number(b.gems) || 0) - (u.gems || 0);
-    if (gGem <= 200) u.gems = Math.max(0, Math.floor(Number(b.gems) || 0));
+    if (gGem <= 5000) u.gems = Math.max(0, Math.floor(Number(b.gems) || 0));
     else {
       let coveredG = (u.purchaseGemsCredit || 0);
-      if (gGem > 200 + coveredG) coveredG += (await purchaseCoverFor(uname)).gems;
-      if (gGem <= 200 + coveredG) { u.gems = Math.max(0, Math.floor(Number(b.gems) || 0)); u.purchaseGemsCredit = Math.max(0, coveredG - gGem + 200); }
+      if (gGem > 5000 + coveredG) coveredG += (await purchaseCoverFor(uname)).gems;
+      if (gGem <= 5000 + coveredG) { u.gems = Math.max(0, Math.floor(Number(b.gems) || 0)); u.purchaseGemsCredit = Math.max(0, coveredG - gGem + 5000); }
       else {
-        u.gems = (u.gems || 0) + 200; // reject suspicious jump
+        u.gems = (u.gems || 0) + 5000; // reject suspicious jump
         payLog({ type: 'sync_cut_gems', username: uname, sentGems: b.gems, keptGems: u.gems });
       }
     }
@@ -435,9 +470,68 @@ const server = http.createServer(async (req, res) => {
     u.totalEarned = Math.max(u.totalEarned || 0, Math.floor(Number(b.totalEarned) || 0));
     u.playerLevel = Math.max(u.playerLevel || 1, Math.floor(Number(b.playerLevel) || 1));
     u.playerXP = Math.max(u.playerXP || 0, Math.floor(Number(b.playerXP) || 0));
+    // v5.14: पूरा बैकअप — skins, power-ups, achievements, missions, battle pass, नाम/फ़ोन/ईमेल
+    if (b.backup && typeof b.backup === 'object') {
+      try {
+        const js = JSON.stringify(b.backup);
+        if (js.length <= 400000) { u.backup = b.backup; u.backupAt = Date.now(); }
+      } catch (e) {}
+    }
+    if (typeof b.name === 'string' && b.name.trim()) u.displayName = b.name.trim().slice(0, 20);
+    if (typeof b.phone === 'string') u.phone = b.phone.slice(0, 15);
+    if (typeof b.email === 'string') u.email = b.email.slice(0, 60);
+    if (typeof b.avatar === 'string' && b.avatar.length < 200000) u.avatar = b.avatar;
     u.lastSync = Date.now();
     saveDB();
     sendJSON(res, 200, { ok: true, profile: publicUser(u) });
+    return;
+  }
+
+  // --- FORGOT PASSWORD (v5.15): रिकवरी कोड से नया पासवर्ड ---
+  if (reqPath === '/api/recover' && method === 'POST') {
+    const b = await readBody(req);
+    const uname = String(b.username || '').trim().toLowerCase();
+    const code = String(b.recoveryCode || '').trim().toUpperCase();
+    const newP = String(b.newPassword || '');
+    const u = DB.users[uname];
+    if (!u) { sendJSON(res, 404, { ok: false, error: 'No account with that username/email' }); return; }
+    if (!u.recHash || !u.recSalt) { sendJSON(res, 400, { ok: false, error: 'No recovery code set for this account. Please contact support.' }); return; }
+    if (hashPassword(code, u.recSalt) !== u.recHash) { sendJSON(res, 403, { ok: false, error: 'Wrong recovery code' }); return; }
+    if (newP.length < 6) { sendJSON(res, 400, { ok: false, error: 'New password too short (min 6)' }); return; }
+    u.salt = crypto.randomBytes(16).toString('hex');
+    u.hash = hashPassword(newP, u.salt);
+    saveDB();
+    sendJSON(res, 200, { ok: true });
+    return;
+  }
+
+  // --- NEW RECOVERY CODE (v5.15, logged-in) ---
+  if (reqPath === '/api/recovery-code' && method === 'POST') {
+    const uname = userFromToken((req.headers.authorization || '').replace('Bearer ', '').trim());
+    if (!uname) { sendJSON(res, 401, { ok: false, error: 'Not authenticated' }); return; }
+    const u = DB.users[uname];
+    if (!u) { sendJSON(res, 401, { ok: false, error: 'Not authenticated' }); return; }
+    const code = makeRecoveryCode();
+    u.recSalt = crypto.randomBytes(16).toString('hex');
+    u.recHash = hashPassword(code, u.recSalt);
+    saveDB();
+    sendJSON(res, 200, { ok: true, recoveryCode: code });
+    return;
+  }
+
+  // --- PASSWORD CHANGE (v5.14) ---
+  if (reqPath === '/api/password' && method === 'POST') {
+    const uname = userFromToken((req.headers.authorization || '').replace('Bearer ', '').trim());
+    if (!uname) { sendJSON(res, 401, { ok: false, error: 'Not authenticated' }); return; }
+    const b = await readBody(req);
+    const oldP = String(b.oldPassword || ''), newP = String(b.newPassword || '');
+    const u = DB.users[uname];
+    if (!u || hashPassword(oldP, u.salt) !== u.hash) { sendJSON(res, 403, { ok: false, error: 'Old password is wrong' }); return; }
+    if (newP.length < 6) { sendJSON(res, 400, { ok: false, error: 'New password too short (min 6)' }); return; }
+    u.salt = crypto.randomBytes(16).toString('hex');
+    u.hash = hashPassword(newP, u.salt);
+    saveDB();
+    sendJSON(res, 200, { ok: true });
     return;
   }
 
